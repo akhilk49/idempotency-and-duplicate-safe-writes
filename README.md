@@ -1,30 +1,74 @@
 # Idempotency and Duplicate-Safe Writes
 
-Build duplicate-safe `POST /incidents` endpoint that returns one durable result when same logical request arrives more than once.
+`POST /incidents` is now duplicate-safe. The same logical request — identified by an authenticated tenant and a client-supplied `Idempotency-Key` — is executed exactly once. Subsequent identical requests replay the stored result; requests with the same key but a different body are rejected.
 
-## Why This Repository Exists
+---
 
-Current starter inserts incident on every request. It has no idempotency record, duplicate claim, stored replay result, or durable paging job. Supplied tests describe required contract.
+## Design Decisions
+
+### 1. Why database uniqueness is needed
+
+A `UNIQUE` constraint on `(tenant_id, operation, key)` in `idempotency_keys` is the single source of truth for "has this key been claimed?". Without it, two concurrent requests that both read "no row exists" would both proceed to insert and both create an incident — the classic lost-update race. The constraint turns the insert into an atomic compare-and-set: only one writer can create the row; every other writer's `INSERT … ON CONFLICT DO NOTHING` silently no-ops, and then the `SELECT … FOR UPDATE` queues them behind the winner until the winner's transaction commits.
+
+### 2. Canonicalization and request binding
+
+`hashRequest(body)` sorts the object keys alphabetically before serializing to JSON and hashing with SHA-256:
+
+```js
+const canonical = JSON.stringify(
+  Object.fromEntries(Object.keys(body).sort().map(k => [k, body[k]]))
+);
+crypto.createHash('sha256').update(canonical).digest('hex');
+```
+
+Sorting eliminates property-order variance so `{title, severity, serviceId}` and `{serviceId, title, severity}` produce the same digest. The hex digest is stored in `request_hash` at claim time. On every subsequent request for the same key the incoming hash is compared to the stored hash:
+
+- **Match + completed** → replay the stored response.
+- **Mismatch** → `409 idempotency_key_conflict` (the key was already used for different content).
+
+### 3. What 24-hour expiry means
+
+Every idempotency record carries an `expires_at = now() + interval '24 hours'`. Within that window:
+
+- Replays return the stored response immediately without touching the database write path.
+- Conflict detection remains active — reusing the key with changed content is still rejected.
+
+After 24 hours the row is considered expired. A future cleanup job (outside the scope of this exercise) can delete expired rows, after which the key slot becomes reusable. The 24-hour window is intentionally generous: it covers the realistic retry horizon for any automated client while bounding storage growth.
+
+### 4. Why the paging job lives in the same transaction
+
+Durability requires that "incident exists" and "paging job exists" are always both true or both false. If the paging job were inserted after the transaction committed, a crash between the two writes would leave an incident with no page — the on-call engineer would never be notified. By inserting `paging_jobs` inside the same `db.tx` block that creates the incident and marks the idempotency key `completed`, all three writes are atomic: either every row lands or none do (PostgreSQL rolls back on any error).
+
+### 5. Privacy and size risks of stored responses
+
+The completed response body is stored verbatim as `JSONB` in `idempotency_keys.response_body`. Two risks follow:
+
+- **Privacy**: the incident record (title, severity, service ID, tenant ID) is replicated outside the `incidents` table. If response bodies ever include PII — user names, free-text descriptions, contact details — that data sits in a secondary table with potentially different access controls. Row-level security policies and audit logging should cover `idempotency_keys` with the same rigour as `incidents`.
+- **Size**: large response bodies inflate the `idempotency_keys` table. This implementation stores only the incident row (a handful of UUID and text columns), so individual rows are small. If the response schema grows — embedded related resources, arrays, blobs — a size cap or a pointer-based design (store only the incident `id` and re-fetch on replay) should be considered.
+
+---
 
 ## Repository Structure
 
 ```text
 .
 ├── db/
-│   └── schema.sql              # incidents table; add idempotency and paging tables
+│   └── schema.sql              # incidents, idempotency_keys, paging_jobs tables
 ├── scripts/
 │   └── resetDb.js              # recreates exercise database
 ├── src/
 │   ├── app.js                  # Express route and error handler
-│   ├── auth.js                 # provides authenticated exercise tenant/user
-│   ├── db.js                   # PostgreSQL connection
-│   └── incidents.js            # broken handler to repair
+│   ├── auth.js                 # provides authenticated tenant/user from headers
+│   ├── db.js                   # PostgreSQL connection via pg-promise
+│   └── incidents.js            # duplicate-safe handler + hashRequest export
 ├── tests/
-│   └── idempotency.test.js     # 14 supplied contract tests
+│   └── idempotency.test.js     # 14 contract tests (unmodified)
 ├── docker-compose.yml          # local PostgreSQL on port 54329
 ├── package.json
 └── package-lock.json
 ```
+
+---
 
 ## Prerequisites
 
@@ -34,108 +78,62 @@ Current starter inserts incident on every request. It has no idempotency record,
 - Docker with Docker Compose
 - GitHub account
 
+---
+
 ## Setup
 
-1. Fork repository to your GitHub account.
-2. Clone your fork:
-
 ```bash
+# 1. Fork and clone
 git clone https://github.com/<your-username>/idempotency-and-duplicate-safe-writes.git
 cd idempotency-and-duplicate-safe-writes
 git checkout -b idempotent-incidents
-```
 
-3. Start PostgreSQL and install dependencies:
-
-```bash
+# 2. Start Postgres and install dependencies
 docker compose up -d
 npm install
-```
 
-4. Reset database and run tests:
-
-```bash
+# 3. Apply schema and run tests
 npm run db:reset
 npm test
 ```
 
-Starter tests fail until required schema and handler are implemented. This is expected.
+---
 
-## What to Implement
+## How Idempotency Works (request lifecycle)
 
-### Database
-
-Add:
-
-- scoped idempotency record with key, request hash, state, replay metadata, and expiry;
-- unique ownership for authenticated tenant + operation + key;
-- durable paging-job table.
-
-### Handler
-
-Implement:
-
-- required `Idempotency-Key` validation;
-- authenticated tenant scope;
-- canonical request hash;
-- atomic key claim before incident creation;
-- completed replay, changed-request conflict, and processing response;
-- one transaction for key, incident, paging job, and completed response.
-
-Do not call external queue/provider inside database transaction.
-
-### README Decisions
-
-Explain:
-
-1. why database uniqueness is needed;
-2. how request contents are canonicalized and compared;
-3. what 24-hour expiry means;
-4. why paging job is stored in same transaction;
-5. privacy and size risks of stored responses.
-
-## Test Coverage
-
-Supplied tests check:
-
-- missing key;
-- first request;
-- sequential replay;
-- replay response header;
-- changed payload conflict;
-- tenant isolation;
-- 20 concurrent duplicates;
-- exactly one incident and paging job;
-- lost response retry;
-- processing and failed states;
-- transaction rollback;
-- canonical hash;
-- stored scope and operation.
-
-Do not change tests.
-
-## Submit Pull Request
-
-```bash
-git add .
-git commit -m "Implement duplicate-safe incident creation"
-git push -u origin idempotent-incidents
+```
+Client ──► POST /incidents  (Idempotency-Key: K, body: B)
+               │
+               ▼
+        Require header ──► 400 if missing
+               │
+               ▼
+        INSERT idempotency_keys (state=processing)
+        ON CONFLICT DO NOTHING
+               │
+               ▼
+        SELECT … FOR UPDATE  ◄─── concurrent requests queue here
+               │
+       ┌───────┴────────────────────┐
+  completed?                  processing?
+       │                            │
+  hash match?               we_own_it (xmin)?
+  yes → 200 replay           yes → create incident
+  no  → 409 conflict              + paging_job
+                                  + mark completed
+                             no  → 409 in_progress
 ```
 
-Open pull request from `idempotent-incidents` into your fork's `main` branch. Include:
+`we_own_it` is detected by comparing the row's `xmin` (PostgreSQL transaction ID that last wrote it) with `txid_current()`. Only the transaction that inserted the row will see `xmin = txid_current()`, making the check race-free inside the same transaction.
 
-- summary of approach;
-- design decisions;
-- passing test output.
-
-Submit pull-request URL, not repository homepage, branch, commit, or PDF link.
+---
 
 ## Troubleshooting
 
-**Docker port conflict:** stop process using port 54329 or change port consistently in Compose and `DATABASE_URL`.
+**Docker port conflict** — stop the process using port 54329 or change the port in `docker-compose.yml` and `DATABASE_URL`.
 
-**Database connection failed:** wait until PostgreSQL is healthy, then run `npm run db:reset` again.
+**Database connection failed** — wait for Postgres to pass its health check, then rerun `npm run db:reset`.
 
-**Tests say idempotency table is missing:** implement schema TODOs and rerun reset before tests.
+**Tests say idempotency table is missing** — run `npm run db:reset` to apply the updated schema.
 
-**Resetting production data:** never point `DATABASE_URL` at shared or production database. Reset script is destructive.
+**Never point `DATABASE_URL` at a shared or production database** — the reset script is destructive.
